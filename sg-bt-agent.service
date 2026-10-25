@@ -1,0 +1,13 @@
+[Unit]
+Description=Agente de emparejamiento Bluetooth para Serpantinum (pregunta con una notificación)
+# Solo en Hyprland: GNOME ya trae su propio agente
+PartOf=graphical-session.target
+After=graphical-session.target bluetooth.target
+
+[Service]
+ExecStart=%h/.local/bin/sg-bt-agent
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=hyprland-session.target

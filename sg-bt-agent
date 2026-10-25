@@ -1,0 +1,185 @@
+#!/usr/bin/python3 -I
+"""sg-bt-agent: agente de emparejamiento Bluetooth para Serpantinum.
+
+Serpantinum puede emparejar desde su panel (device.pair()), pero no trae un "agente": el programa
+que responde "¿aceptas este dispositivo?". Sin agente, BlueZ rechaza el emparejamiento
+("No agent available"). Este agente pregunta con una notificación de Serpantinum:
+
+    Rechazar (primera acción: un clic accidental en la notificación RECHAZA) · Aceptar
+
+Sin respuesta en 30 s se rechaza. Nunca acepta solo.
+"""
+import os
+import subprocess
+import sys
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+BLUEZ = os.environ.get("SG_BT_BUS_NAME", "org.bluez")
+AGENT_PATH = "/org/serpantinum/btagent"
+CAPABILITY = "DisplayYesNo"      # puede mostrar un código y preguntar sí/no; no puede escribir
+TIMEOUT = 30                     # segundos para responder (BlueZ espera hasta 60)
+NOTIFY = os.environ.get("SG_BT_NOTIFY", "notify-send")
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+class Rejected(dbus.DBusException):
+    _dbus_error_name = "org.bluez.Error.Rejected"
+
+
+class Canceled(dbus.DBusException):
+    _dbus_error_name = "org.bluez.Error.Canceled"
+
+
+def device_alias(path):
+    try:
+        props = dbus.Interface(bus.get_object(BLUEZ, path), "org.freedesktop.DBus.Properties")
+        name = str(props.Get("org.bluez.Device1", "Alias"))
+        return "".join(c for c in name if c.isprintable())[:64] or "Un dispositivo"
+    except dbus.DBusException:
+        return "Un dispositivo"
+
+
+def set_trusted(path):
+    try:
+        props = dbus.Interface(bus.get_object(BLUEZ, path), "org.freedesktop.DBus.Properties")
+        props.Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
+    except dbus.DBusException as e:
+        log(f"no se pudo marcar como de confianza: {e}")
+
+
+def notify(title, body):
+    subprocess.Popen([NOTIFY, "--app-name=Bluetooth", "--icon=bluetooth", title, body],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class Agent(dbus.service.Object):
+    def __init__(self, conn, path):
+        super().__init__(conn, path)
+        self.pending = None          # (Popen, reply, error, device) de la pregunta en curso
+
+    # --- pregunta asíncrona: no bloquea el bucle mientras el usuario decide ---
+    def _ask(self, device, title, body, reply, error):
+        self._cancel_pending()
+        try:
+            proc = subprocess.Popen(
+                [NOTIFY, "--app-name=Bluetooth", "--icon=bluetooth", "--urgency=critical",
+                 f"--expire-time={TIMEOUT * 1000}",
+                 "--action=no=Rechazar", "--action=yes=Aceptar", title, body],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError as e:
+            log(f"no se pudo mostrar la notificación: {e}")
+            error(Rejected("Sin forma de preguntar"))
+            return
+        self.pending = (proc, reply, error, device)
+        started = GLib.get_monotonic_time()
+
+        def poll():
+            if self.pending is None or self.pending[0] is not proc:
+                return False                     # se canceló
+            if proc.poll() is None:
+                if GLib.get_monotonic_time() - started > TIMEOUT * 1_000_000:
+                    self.pending = None
+                    proc.terminate()
+                    error(Rejected("Sin respuesta"))
+                    return False
+                return True
+            self.pending = None
+            answer = (proc.stdout.read() or "").strip()
+            if answer == "yes":
+                set_trusted(device)
+                log(f"aceptado: {device}")
+                reply()
+            else:
+                log(f"rechazado: {device} ({answer or 'cerrada'})")
+                error(Rejected("Rechazado por el usuario"))
+            return False
+
+        GLib.timeout_add(200, poll)
+
+    def _cancel_pending(self):
+        """Cierra la pregunta en curso y le responde a BlueZ que se canceló (nunca la acepta)."""
+        if self.pending is not None:
+            proc, _reply, error, _device = self.pending
+            self.pending = None
+            if proc.poll() is None:
+                proc.terminate()
+            error(Canceled("Cancelado"))
+
+    # --- métodos de org.bluez.Agent1 ---
+    @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+    def Release(self):
+        log("BlueZ liberó el agente")
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="",
+                         async_callbacks=("reply", "error"))
+    def RequestConfirmation(self, device, passkey, reply, error):
+        name = device_alias(device)
+        self._ask(device, f"¿Emparejar {name}?",
+                  f"Comprueba que el código sea {int(passkey):06d} en los dos equipos.", reply, error)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="",
+                         async_callbacks=("reply", "error"))
+    def RequestAuthorization(self, device, reply, error):
+        self._ask(device, f"¿Emparejar {device_alias(device)}?",
+                  "Un dispositivo quiere emparejarse con esta laptop.", reply, error)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="",
+                         async_callbacks=("reply", "error"))
+    def AuthorizeService(self, device, uuid, reply, error):
+        self._ask(device, f"¿Permitir a {device_alias(device)}?",
+                  "Quiere usar un servicio de Bluetooth.", reply, error)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        if int(entered) == 0:   # solo la primera vez, no en cada tecla
+            notify(f"Emparejar {device_alias(device)}",
+                   f"Escribe {int(passkey):06d} en el dispositivo y presiona Enter.")
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        notify(f"Emparejar {device_alias(device)}", f"Escribe {pincode} en el dispositivo.")
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        notify("Bluetooth", f"{device_alias(device)} pide escribir un PIN: emparéjalo con bluetoothctl.")
+        raise Rejected("Este agente no puede escribir códigos")
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        notify("Bluetooth", f"{device_alias(device)} pide escribir un código: emparéjalo con bluetoothctl.")
+        raise Rejected("Este agente no puede escribir códigos")
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+    def Cancel(self):
+        log("BlueZ canceló la solicitud")
+        self._cancel_pending()
+
+
+def register():
+    manager = dbus.Interface(bus.get_object(BLUEZ, "/org/bluez"), "org.bluez.AgentManager1")
+    manager.RegisterAgent(AGENT_PATH, CAPABILITY)
+    manager.RequestDefaultAgent(AGENT_PATH)
+    log(f"agente registrado ({CAPABILITY}) y como predeterminado")
+
+
+def on_bluez_owner(new_owner):
+    if new_owner:                # BlueZ arrancó o se reinició: volver a registrarse
+        try:
+            register()
+        except dbus.DBusException as e:
+            log(f"no se pudo registrar: {e}")
+
+
+if __name__ == "__main__":
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus() if os.environ.get("SG_BT_TEST_SESSION_BUS") else dbus.SystemBus()
+    agent = Agent(bus, AGENT_PATH)
+    bus.watch_name_owner(BLUEZ, on_bluez_owner)
+    GLib.MainLoop().run()
