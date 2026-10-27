@@ -8,6 +8,11 @@ que responde "¿aceptas este dispositivo?". Sin agente, BlueZ rechaza el emparej
     Rechazar (primera acción: un clic accidental en la notificación RECHAZA) · Aceptar
 
 Sin respuesta en 30 s se rechaza. Nunca acepta solo.
+
+Además, completa la conexión después de emparejar: el panel llama a device.connect() apenas termina
+el emparejamiento, pero en ese momento BlueZ todavía marca Connected (es el enlace que usó para
+emparejar), y Quickshell se niega ("is already connected"). Queda emparejado pero sin audio. Para
+parlantes, audífonos, mouse y teclados, el agente le pide Connect() a BlueZ directamente.
 """
 import os
 import subprocess
@@ -23,6 +28,8 @@ AGENT_PATH = "/org/serpantinum/btagent"
 CAPABILITY = "DisplayYesNo"      # puede mostrar un código y preguntar sí/no; no puede escribir
 TIMEOUT = 30                     # segundos para responder (BlueZ espera hasta 60)
 NOTIFY = os.environ.get("SG_BT_NOTIFY", "notify-send")
+CONNECT_ICONS = ("audio-", "input-")  # se conectan solos al emparejar; celulares y laptops no
+CONNECT_DELAY = 2                # segundos: deja terminar al panel antes de pedir la conexión
 
 
 def log(msg):
@@ -169,6 +176,28 @@ def register():
     log(f"agente registrado ({CAPABILITY}) y como predeterminado")
 
 
+def connect_after_pairing(path):
+    try:
+        props = dbus.Interface(bus.get_object(BLUEZ, path), "org.freedesktop.DBus.Properties")
+        paired = bool(props.Get("org.bluez.Device1", "Paired"))
+        icon = str(props.Get("org.bluez.Device1", "Icon"))
+    except dbus.DBusException:
+        return False                 # si no se puede confirmar qué es, no se conecta
+    if not paired or not icon.startswith(CONNECT_ICONS):
+        return False
+    dev = dbus.Interface(bus.get_object(BLUEZ, path), "org.bluez.Device1")
+    # Si el panel ya lo conectó, BlueZ responde AlreadyConnected o InProgress: no pasa nada
+    dev.Connect(timeout=60,
+                reply_handler=lambda: log(f"conectado después de emparejar: {path}"),
+                error_handler=lambda e: log(f"conectar después de emparejar: {path}: {e.get_dbus_name()}"))
+    return False                     # una sola vez (GLib.timeout_add_seconds)
+
+
+def on_device_changed(interface, changed, _invalidated, path=None):
+    if interface == "org.bluez.Device1" and bool(changed.get("Paired", False)):
+        GLib.timeout_add_seconds(CONNECT_DELAY, connect_after_pairing, path)
+
+
 def on_bluez_owner(new_owner):
     if new_owner:                # BlueZ arrancó o se reinició: volver a registrarse
         try:
@@ -182,4 +211,8 @@ if __name__ == "__main__":
     bus = dbus.SessionBus() if os.environ.get("SG_BT_TEST_SESSION_BUS") else dbus.SystemBus()
     agent = Agent(bus, AGENT_PATH)
     bus.watch_name_owner(BLUEZ, on_bluez_owner)
+    # bus_name: solo las señales de BlueZ (dbus-python sigue al nuevo dueño si BlueZ se reinicia)
+    bus.add_signal_receiver(on_device_changed, signal_name="PropertiesChanged",
+                            dbus_interface="org.freedesktop.DBus.Properties", arg0="org.bluez.Device1",
+                            bus_name=BLUEZ, path_keyword="path")
     GLib.MainLoop().run()

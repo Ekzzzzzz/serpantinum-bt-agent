@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Pruebas de sg-bt-agent. No tocan tu Bluetooth: levantan un D-Bus privado (dbus-launch) con un BlueZ
 # falso, y reemplazan notify-send por un script que "responde" lo que diga el archivo modo.
-#   bash tests/test-sg-bt-agent.sh        (tarda unos 35 s: un caso espera el tiempo límite de 30 s)
+#   bash tests/test-sg-bt-agent.sh        (tarda unos 45 s: un caso espera el tiempo límite de 30 s)
 # Requiere: python3-dbus, python3-gobject, dbus-launch (dbus-x11 o dbus-daemon).
 # shellcheck disable=SC2016  # los $ entre comillas simples son para los scripts falsos
 set -uo pipefail
@@ -28,11 +28,20 @@ class Manager(dbus.service.Object):
     @dbus.service.method("org.bluez.AgentManager1", in_signature="o")
     def RequestDefaultAgent(self, ruta): print("PREDETERMINADO", ruta, flush=True)
 class Dispositivo(dbus.service.Object):
+    def __init__(self, ruta, icono):
+        super().__init__(bus, ruta); self.ruta = ruta; self.icono = icono
     @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v")
-    def Get(self, i, p): return {"Alias": "Mouse\x07 de prueba", "Trusted": False}[p]
+    def Get(self, i, p): return {"Alias": "Mouse\x07 de prueba", "Trusted": False, "Icon": self.icono, "Paired": True}[p]
     @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ssv")
     def Set(self, i, p, v): print("TRUSTED", bool(v), flush=True)
-Manager(bus, "/org/bluez"); Dispositivo(bus, "/org/bluez/hci0/dev_PRUEBA")
+    @dbus.service.signal("org.freedesktop.DBus.Properties", signature="sa{sv}as")
+    def PropertiesChanged(self, i, cambios, invalidadas): pass
+    @dbus.service.method("org.bluez.Device1")
+    def Connect(self): print("CONNECT", self.ruta, flush=True)
+    @dbus.service.method("prueba.Control", in_signature="sb")   # la prueba "anuncia" un cambio
+    def Anunciar(self, prop, valor): self.PropertiesChanged("org.bluez.Device1", {prop: valor}, [])
+Manager(bus, "/org/bluez"); Dispositivo("/org/bluez/hci0/dev_PRUEBA", "input-mouse")
+Dispositivo("/org/bluez/hci0/dev_PARLANTE", "audio-card"); Dispositivo("/org/bluez/hci0/dev_CELULAR", "phone")
 GLib.MainLoop().run()
 EOF
 # ---------- cliente: hace de BlueZ llamando al agente ----------
@@ -95,6 +104,26 @@ AG="$(cat agente.nombre)"
 caso "9. sin respuesta en 30 s → rechaza (nunca acepta solo)"
     inicio=$(date +%s); r=$(pedir esperar autorizar); dur=$(( $(date +%s) - inicio ))
     if [ "$r" = org.bluez.Error.Rejected ] && [ "$dur" -ge 29 ] && [ "$dur" -le 40 ]; then bien; else mal "$r en ${dur}s"; fi
+
+# Después de emparejar (casos 10-12, con el BlueZ que se reinició en el caso 8)
+anunciar() {   # --print-reply: sin él, dbus-send manda una señal en vez de llamar al método
+    dbus-send --session --print-reply --dest=org.bluez.prueba "/org/bluez/hci0/dev_$1" \
+        prueba.Control.Anunciar "string:$2" "boolean:$3" > /dev/null; }
+caso "10. parlante emparejado → el agente pide Connect() a los ~2 s"
+    anunciar PARLANTE Paired true; sleep 1
+    if grep -q "CONNECT .*dev_PARLANTE" bluez.log; then mal "no esperó los 2 s"; else
+        sleep 2; if grep -q "CONNECT .*dev_PARLANTE" bluez.log; then bien; else mal "$(tail -3 agente.log)"; fi; fi
+caso "11. celular emparejado → no se conecta solo"
+    anunciar CELULAR Paired true; sleep 3
+    if grep -q "CONNECT .*dev_CELULAR" bluez.log; then mal "conectó un celular"; else bien; fi
+caso "12. desemparejar u otro cambio → no se conecta"
+    n=$(grep -c "CONNECT" bluez.log); anunciar PARLANTE Paired false; anunciar PARLANTE Trusted true; sleep 3
+    if [ "$(grep -c "CONNECT" bluez.log)" -eq "$n" ]; then bien; else mal "pidió Connect sin emparejar"; fi
+caso "13. señal falsa de otro programa (no BlueZ) → se ignora"
+    n=$(grep -c "CONNECT" bluez.log)
+    python3 -I -c 'import dbus, dbus.lowlevel as l; m = l.SignalMessage("/org/bluez/hci0/dev_PARLANTE", "org.freedesktop.DBus.Properties", "PropertiesChanged"); m.append("org.bluez.Device1", dbus.Dictionary({"Paired": dbus.Boolean(True)}, signature="sv"), dbus.Array([], signature="s")); dbus.SessionBus().send_message(m)'
+    sleep 3
+    if [ "$(grep -c "CONNECT" bluez.log)" -eq "$n" ]; then bien; else mal "le hizo caso a otro programa"; fi
 
 echo; echo "Resultado: $pasaron pasaron, $fallaron fallaron"
 [ "$fallaron" -eq 0 ]
