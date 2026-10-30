@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Pruebas de sg-bt-agent. No tocan tu Bluetooth: levantan un D-Bus privado (dbus-launch) con un BlueZ
 # falso, y reemplazan notify-send por un script que "responde" lo que diga el archivo modo.
-#   bash tests/test-sg-bt-agent.sh        (tarda unos 45 s: un caso espera el tiempo límite de 30 s)
+#   bash tests/test-sg-bt-agent.sh        (tarda poco más de 1 min: un caso espera el tiempo límite de 30 s)
 # Requiere: python3-dbus, python3-gobject, dbus-launch (dbus-x11 o dbus-daemon).
 # shellcheck disable=SC2016  # los $ entre comillas simples son para los scripts falsos
 set -uo pipefail
@@ -15,7 +15,7 @@ limpiar() { for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done; [ -n "${DBUS_
 trap limpiar EXIT
 pasaron=0; fallaron=0
 
-# ---------- BlueZ falso: AgentManager1 + un dispositivo con Alias y Trusted ----------
+# ---------- BlueZ falso: AgentManager1 + tres dispositivos (Alias, Icon, Paired, Trusted) ----------
 cat > bluez_falso.py <<'EOF'
 import dbus, dbus.service, dbus.mainloop.glib
 from gi.repository import GLib
@@ -28,10 +28,10 @@ class Manager(dbus.service.Object):
     @dbus.service.method("org.bluez.AgentManager1", in_signature="o")
     def RequestDefaultAgent(self, ruta): print("PREDETERMINADO", ruta, flush=True)
 class Dispositivo(dbus.service.Object):
-    def __init__(self, ruta, icono):
-        super().__init__(bus, ruta); self.ruta = ruta; self.icono = icono
+    def __init__(self, ruta, icono, emparejado):
+        super().__init__(bus, ruta); self.ruta = ruta; self.icono = icono; self.emparejado = emparejado
     @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v")
-    def Get(self, i, p): return {"Alias": "Mouse\x07 de prueba", "Trusted": False, "Icon": self.icono, "Paired": True}[p]
+    def Get(self, i, p): return {"Alias": "Mouse\x07 de prueba", "Trusted": False, "Icon": self.icono, "Paired": self.emparejado}[p]
     @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ssv")
     def Set(self, i, p, v): print("TRUSTED", bool(v), flush=True)
     @dbus.service.signal("org.freedesktop.DBus.Properties", signature="sa{sv}as")
@@ -40,8 +40,8 @@ class Dispositivo(dbus.service.Object):
     def Connect(self): print("CONNECT", self.ruta, flush=True)
     @dbus.service.method("prueba.Control", in_signature="sb")   # la prueba "anuncia" un cambio
     def Anunciar(self, prop, valor): self.PropertiesChanged("org.bluez.Device1", {prop: valor}, [])
-Manager(bus, "/org/bluez"); Dispositivo("/org/bluez/hci0/dev_PRUEBA", "input-mouse")
-Dispositivo("/org/bluez/hci0/dev_PARLANTE", "audio-card"); Dispositivo("/org/bluez/hci0/dev_CELULAR", "phone")
+Manager(bus, "/org/bluez"); Dispositivo("/org/bluez/hci0/dev_PRUEBA", "input-mouse", False)
+Dispositivo("/org/bluez/hci0/dev_PARLANTE", "audio-card", True); Dispositivo("/org/bluez/hci0/dev_CELULAR", "phone", True)
 GLib.MainLoop().run()
 EOF
 # ---------- cliente: hace de BlueZ llamando al agente ----------
@@ -49,7 +49,7 @@ cat > cliente.py <<'EOF'
 import dbus, sys
 bus = dbus.SessionBus()
 a = dbus.Interface(bus.get_object(sys.argv[1], "/org/serpantinum/btagent"), "org.bluez.Agent1")
-dev = dbus.ObjectPath("/org/bluez/hci0/dev_PRUEBA"); m = sys.argv[2]
+dev = dbus.ObjectPath("/org/bluez/hci0/dev_" + (sys.argv[3] if len(sys.argv) > 3 else "PRUEBA")); m = sys.argv[2]
 try:
     if m == "confirmar": a.RequestConfirmation(dev, dbus.UInt32(123456), timeout=60)
     elif m == "autorizar": a.RequestAuthorization(dev, timeout=60)
@@ -68,18 +68,21 @@ esac
 EOF
 chmod +x notify-falso
 
+# main.conf de prueba: la línea comentada, como viene en Fedora (BlueZ usa "never")
+printf '[General]\n#JustWorksRepairing = never\n' > main-defecto.conf
+
 eval "$(dbus-launch --sh-syntax)" || { echo "falta dbus-launch" >&2; exit 1; }
 arrancar_bluez() { python3 -I bluez_falso.py >> bluez.log 2>&1 & pids+=($!); BLUEZ_PID=$!; sleep 1; }
 arrancar_bluez
 SG_BT_TEST_SESSION_BUS=1 SG_BT_BUS_NAME=org.bluez.prueba SG_BT_NOTIFY="$T/notify-falso" \
-    python3 -I "$AGENTE" > agente.log 2>&1 & pids+=($!)
+    SG_BT_MAIN_CONF="$T/main-defecto.conf" python3 -I "$AGENTE" > agente.log 2>&1 & pids+=($!)
 sleep 1.5
 AG="$(cat agente.nombre 2>/dev/null)"
 
 caso() { printf '%-58s' "$1"; }
 bien() { echo "✅"; pasaron=$((pasaron + 1)); }
 mal()  { echo "❌  $*"; fallaron=$((fallaron + 1)); }
-pedir() { echo "$1" > modo; python3 -I cliente.py "$AG" "$2" 2>/dev/null | tail -1; }
+pedir() { echo "$1" > modo; python3 -I cliente.py "$AG" "$2" "${3:-PRUEBA}" 2>/dev/null | tail -1; }
 
 caso "1. se registra como agente predeterminado (DisplayYesNo)"
     if grep -q "REGISTRADO /org/serpantinum/btagent DisplayYesNo" bluez.log && grep -q PREDETERMINADO bluez.log; then bien; else mal "$(cat bluez.log agente.log)"; fi
@@ -124,6 +127,26 @@ caso "13. señal falsa de otro programa (no BlueZ) → se ignora"
     python3 -I -c 'import dbus, dbus.lowlevel as l; m = l.SignalMessage("/org/bluez/hci0/dev_PARLANTE", "org.freedesktop.DBus.Properties", "PropertiesChanged"); m.append("org.bluez.Device1", dbus.Dictionary({"Paired": dbus.Boolean(True)}, signature="sv"), dbus.Array([], signature="s")); dbus.SessionBus().send_message(m)'
     sleep 3
     if [ "$(grep -c "CONNECT" bluez.log)" -eq "$n" ]; then bien; else mal "le hizo caso a otro programa"; fi
+
+# Re-emparejamiento (casos 14-17): un dispositivo que YA estaba emparejado perdió su llave y pide
+# emparejarse de nuevo. Con JustWorksRepairing = confirm, BlueZ llama a RequestAuthorization.
+caso "14. re-emparejamiento aceptado → lo explica y conecta a los ~4 s"
+    n=$(grep -c "CONNECT .*dev_PARLANTE" bluez.log); r=$(pedir aceptar autorizar PARLANTE); sleep 2
+    if [ "$r" != ACEPTADO ] || ! grep -q "Volver a emparejar" notificaciones.log; then mal "$r · $(tail -1 notificaciones.log)"
+    elif [ "$(grep -c "CONNECT .*dev_PARLANTE" bluez.log)" -ne "$n" ]; then mal "no esperó los 4 s"
+    else sleep 3; if [ "$(grep -c "CONNECT .*dev_PARLANTE" bluez.log)" -gt "$n" ]; then bien; else mal "no pidió Connect"; fi; fi
+caso "15. re-emparejamiento rechazado → Rejected y no conecta"
+    n=$(grep -c "CONNECT" bluez.log); r=$(pedir rechazar autorizar PARLANTE); sleep 5
+    if [ "$r" = org.bluez.Error.Rejected ] && [ "$(grep -c "CONNECT" bluez.log)" -eq "$n" ]; then bien; else mal "$r"; fi
+caso "16. BlueZ en \"never\" (por defecto) → aviso en el registro"
+    if grep -q "aviso: JustWorksRepairing = never" agente.log; then bien; else mal "$(cat agente.log)"; fi
+caso "17. \"confirm\" en [General] no avisa; en otra sección sí"
+    politica() {   # arranca otro agente solo para leer su aviso (sin BlueZ: no se registra)
+        printf '%b' "$1" > politica.conf
+        SG_BT_TEST_SESSION_BUS=1 SG_BT_BUS_NAME=org.bluez.noexiste SG_BT_MAIN_CONF="$T/politica.conf" \
+            timeout 2 python3 -I "$AGENTE" 2>&1 | grep -c "aviso: JustWorksRepairing"; }
+    a=$(politica '[General]\nJustWorksRepairing = confirm\n'); b=$(politica '[General]\n[Policy]\nJustWorksRepairing = confirm\n')
+    if [ "$a" = 0 ] && [ "$b" = 1 ]; then bien; else mal "en [General]: $a avisos · en [Policy]: $b"; fi
 
 echo; echo "Resultado: $pasaron pasaron, $fallaron fallaron"
 [ "$fallaron" -eq 0 ]
